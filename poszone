@@ -1,6 +1,6 @@
 Option Explicit
 
-Private Const MACRO_VERSION As String = "V3.3-SURGICAL-CALLOUT-BORDER-FIX"
+Private Const MACRO_VERSION As String = "V3.5.1-SEM-PINTURA"
 Private Const CALLOUT_FRAME_NONE As Long = 0
 Private Const CALLOUT_FRAME_CIRCLE As Long = 3
 Private Const CALLOUT_FRAME_LEGACY_53 As Long = 53
@@ -19,12 +19,30 @@ Private Const REF_DISTANCE_BASE As Double = 35#
 Private Const QTY_DISTANCE_MIN As Double = 20#
 Private Const QTY_DISTANCE_MAX As Double = 120#
 Private Const QTY_DISTANCE_BASE As Double = 70#
+' Quantidade ao lado: os blocos do callout e do texto "2 PL" precisam estar na mesma
+' linha (alturas sobrepostas, com folga de QTY_LINE_SLACK_RATIO x altura da fonte).
+Private Const QTY_LINE_SLACK_RATIO As Double = 0.5
+Private Const QTY_LINE_DEFAULT As Double = 5#
+' Chave de quantidade: linha vertical com o "2 REQD" de um lado e uma coluna de callouts
+' do outro. A quantidade vale para todos os callouts que a linha engloba (centro dentro
+' da altura da linha, com folga de BRACKET_END_SLACK_RATIO x altura da fonte).
+Private Const BRACKET_VERTICAL_TOL As Double = 0.05
+Private Const BRACKET_GAP_RATIO As Double = 2#
+Private Const BRACKET_END_SLACK_RATIO As Double = 0.25
+' Teto de seguranca para varrer a geometria de uma vista atras de chave (cerca de 25 s).
+Private Const BRACKET_MAX_GEOMETRIA As Long = 200000
 Private Const ZONE_MIN_ROWS As Long = 2
 Private Const ZONE_MIN_COLS As Long = 3
 Private Const ZONE_EDGE_RATIO As Double = 0.12
 Private Const ZONE_EDGE_MIN As Double = 15#
 Private Const ZONE_EDGE_MAX As Double = 80#
 Private Const ZONE_SPACING_ERROR_MAX As Double = 0.25
+' Aglomerado de baloes: um em cima do outro, centros a ate CLUSTER_LINK_FACTOR x altura do texto do balao.
+Private Const CLUSTER_LINK_FACTOR As Double = 4.5
+Private Const CLUSTER_LINK_DEFAULT As Double = 20#
+' Estimativa do tamanho do bloco de texto a partir da altura da fonte.
+Private Const TEXT_WIDTH_RATIO As Double = 0.8
+Private Const TEXT_LINE_SPACING As Double = 1.5
 
 Private Type ZoneData
     name As String
@@ -74,7 +92,22 @@ Private Type OccurrenceData
     sourceLineIndex As Long
     IsReference As Boolean
     HasExplicitQty As Boolean
+    cx As Double
+    cy As Double
+    fontSize As Double
+    halfHeight As Double
+    halfWidth As Double
+    clusterId As Long
 End Type
+
+' Linhas verticais da vista atual (chaves de quantidade), em mm de papel. Lidas so
+' quando aparece o primeiro texto de quantidade solto da vista.
+Private mChaveX() As Double, mChaveYMin() As Double, mChaveYMax() As Double
+Private mNumChaves As Long, mChavesCarregadas As Boolean
+' Posicao, escala e angulo da ultima vista convertida. Zerado no inicio e no fim da macro
+' e tambem antes de cada folha e de cada vista (EsquecerVistaConvertida): nao se confia so
+' no "Is" do objeto COM do CATIA, e a posicao de uma folha nunca pode ser usada na outra.
+Private mVistaCache As Object, mVistaX As Double, mVistaY As Double, mVistaSc As Double, mVistaA As Double
 
 Public Sub MapearCalloutsTodasAsFolhas1214()
     Dim oDoc As drawingDocument
@@ -88,7 +121,7 @@ Public Sub MapearCalloutsTodasAsFolhas1214()
 
     Dim verdes As New Collection, vermelhos As New Collection
     Dim qtdVerdes As Long, qtdGrupo As Long, qtdConflito As Long
-    Dim qtdReferencias As Long, qtdMultiline As Long, falhasCor As Long
+    Dim qtdReferencias As Long, qtdMultiline As Long, qtdChaves As Long
     Dim drawingName As String, p As Long
     p = InStrRev(oDoc.name, ".")
     If p > 1 Then drawingName = Left$(oDoc.name, p - 1) Else drawingName = oDoc.name
@@ -97,7 +130,7 @@ Public Sub MapearCalloutsTodasAsFolhas1214()
     Dim templatePath As String, tempPath As String, outputPath As String
     templatePath = "\\SJKFS17\Mezcal\Projects\OEM\EMB170-190\05. Quality\09. Macros\_Callouts.xlsm"
     If Len(Dir$(templatePath)) = 0 Then
-        MsgBox "O template não foi encontrado:" & vbCrLf & vbCrLf & templatePath, vbCritical, "Template não encontrado"
+        MsgBox "O template n o foi encontrado:" & vbCrLf & vbCrLf & templatePath, vbCritical, "Template n o encontrado"
         Exit Sub
     End If
     tempPath = Trim$(Environ$("TEMP"))
@@ -116,14 +149,14 @@ Public Sub MapearCalloutsTodasAsFolhas1214()
     On Error Resume Next
     Set xlWS = xlWB.Worksheets("Dados_Callouts")
     On Error GoTo ErroAbrirExcel
-    If xlWS Is Nothing Then Err.Raise vbObjectError + 2001, "MapearCalloutsTodasAsFolhas121", "A planilha Dados_Callouts não foi encontrada."
+    If xlWS Is Nothing Then Err.Raise vbObjectError + 2001, "MapearCalloutsTodasAsFolhas121", "A planilha Dados_Callouts n o foi encontrada."
 
     Dim lastRow As Long
     lastRow = xlWS.Cells(xlWS.rows.count, "A").End(-4162).Row
     If lastRow >= 4 Then
         With xlWS.Range("A4:D" & lastRow)
             .ClearContents
-            .Interior.Pattern = -4142
+            .Interior.pattern = -4142
             .Font.Color = RGB(0, 0, 0)
         End With
     End If
@@ -135,89 +168,139 @@ Public Sub MapearCalloutsTodasAsFolhas1214()
     End With
 
     Dim Occurrences() As OccurrenceData, nOccurrences As Long
-    Dim w As Long, oSheet As drawingSheet
+    Dim w As Long, oSheet As drawingSheet, numeroFolha As Long, ehDetalhe As Boolean
+    ' Sem redesenhar a tela enquanto le as folhas.
+    Set mVistaCache = Nothing
+    On Error Resume Next: CATIA.RefreshDisplay = False: On Error GoTo ErroAbrirExcel
     For w = 1 To oDoc.Sheets.count
         Set oSheet = oDoc.Sheets.item(w)
+        ' Numero da folha de desenho (detail sheet nao conta), usado na coluna da zona.
+        ehDetalhe = False: On Error Resume Next: ehDetalhe = oSheet.IsDetail: Err.Clear: On Error GoTo ErroAbrirExcel
+        If Not ehDetalhe Then numeroFolha = numeroFolha + 1
         Dim Zonas() As ZoneData, maxZonas As Long
         maxZonas = 0: Erase Zonas
-        MapearZonasDaFolha oSheet, Zonas, maxZonas
+        MapearZonasDaFolha oSheet, numeroFolha, Zonas, maxZonas
         ProcessarCalloutsDaFolha oSheet, Zonas, maxZonas, Occurrences, nOccurrences, _
-            verdes, vermelhos, qtdVerdes, qtdGrupo, qtdConflito, qtdReferencias, qtdMultiline
+            verdes, vermelhos, qtdVerdes, qtdGrupo, qtdConflito, qtdReferencias, qtdMultiline, qtdChaves
     Next w
 
     Dim Callouts() As CalloutData, nCallouts As Long
     ConsolidarOcorrencias Occurrences, nOccurrences, Callouts, nCallouts
 
-    Dim rowIdx As Long, n As Long, c As Long
-    rowIdx = 4
-    For n = 1 To nCallouts
-        If IsNumeric(Callouts(n).number) Then xlWS.Cells(rowIdx, 1).value = CDbl(Callouts(n).number) Else xlWS.Cells(rowIdx, 1).value = Callouts(n).number
-        xlWS.Cells(rowIdx, 2).value = Callouts(n).zone
-        xlWS.Cells(rowIdx, 3).value = Callouts(n).qty
-        xlWS.Cells(rowIdx, 4).value = Callouts(n).Sheet & " - " & Callouts(n).View
-        For c = 1 To 4
-            With xlWS.Cells(rowIdx, c)
-                .Font.name = "Segoe UI": .Font.Size = 10
-                .Borders.LineStyle = 1: .Borders.Color = RGB(217, 217, 217)
-                If c <= 3 Then .HorizontalAlignment = -4108
-            End With
-        Next c
-        rowIdx = rowIdx + 1
-    Next n
-    If rowIdx > 4 Then xlWS.Range("A3:D" & rowIdx - 1).Sort Key1:=xlWS.Range("A4"), Order1:=1, Header:=1
+    ' Nenhum callout e pintado: o desenho fica com as cores originais. Os agrupados/ambiguos
+    ' nao contabilizados so aparecem na contagem da mensagem final.
+    Set mVistaCache = Nothing
+    On Error Resume Next: CATIA.RefreshDisplay = True: On Error GoTo ErroAbrirExcel
+
+    ' A tabela vai inteira para o Excel numa escrita so, e a formatacao e aplicada ao bloco
+    ' todo: cada chamada ao Excel e lenta, e antes eram umas dez por celula.
+    Dim n As Long, ultimaLinha As Long, dados() As Variant
+    xlApp.ScreenUpdating = False
+    If nCallouts > 0 Then
+        ultimaLinha = nCallouts + 3
+        ReDim dados(1 To nCallouts, 1 To 4)
+        For n = 1 To nCallouts
+            If IsNumeric(Callouts(n).number) Then dados(n, 1) = CDbl(Callouts(n).number) Else dados(n, 1) = Callouts(n).number
+            dados(n, 2) = Callouts(n).zone
+            dados(n, 3) = Callouts(n).qty
+            dados(n, 4) = Callouts(n).Sheet & " - " & Callouts(n).View
+        Next n
+        With xlWS.Range("A4:D" & ultimaLinha)
+            .value = dados
+            .Font.name = "Segoe UI": .Font.Size = 10
+            .Borders.LineStyle = 1: .Borders.Color = RGB(217, 217, 217)
+        End With
+        xlWS.Range("A4:C" & ultimaLinha).HorizontalAlignment = -4108
+        xlWS.Range("A3:D" & ultimaLinha).Sort Key1:=xlWS.Range("A4"), Order1:=1, Header:=1
+    End If
     xlWS.Columns("A:D").AutoFit
+    xlApp.ScreenUpdating = True
     xlWB.Saved = False
     xlWS.Activate
     RestaurarWorkingViewsPrimeiraFolha oDoc
 
     MsgBox "Macro " & MACRO_VERSION & vbCrLf & _
-        "Processamento concluído para o PN " & drawingName & "!" & vbCrLf & vbCrLf & _
-        "Objetos válidos identificados: " & qtdVerdes & vbCrLf & _
+        "Processamento conclu do para o PN " & drawingName & "!" & vbCrLf & vbCrLf & _
+        "Objetos v lidos identificados: " & qtdVerdes & vbCrLf & _
         "Linhas multilinha contabilizadas: " & qtdMultiline & vbCrLf & _
-        "Referências ignoradas por REF: " & qtdReferencias & vbCrLf & _
-        "Vermelhos agrupados/ambíguos: " & qtdGrupo & vbCrLf & _
-        "Vermelhos inconsistentes: " & qtdConflito & vbCrLf & _
-        "Ocorrências válidas encontradas: " & nOccurrences - qtdReferencias & vbCrLf & _
-        "Callouts consolidados no Excel: " & nCallouts & vbCrLf & _
-        "Falhas ao aplicar cor: " & falhasCor, vbInformation, "Sucesso"
+        "Refer ncias ignoradas por REF: " & qtdReferencias & vbCrLf & _
+        "Quantidades aplicadas por chave (linha vertical): " & qtdChaves & vbCrLf & _
+        "Agrupados/amb guos n o contabilizados: " & qtdGrupo & vbCrLf & _
+        "Inconsistentes n o contabilizados: " & qtdConflito & vbCrLf & _
+        "Ocorr ncias v lidas encontradas: " & nOccurrences - qtdReferencias & vbCrLf & _
+        "Callouts consolidados no Excel: " & nCallouts, vbInformation, "Sucesso"
     Exit Sub
 ErroCriarCopia:
-    MsgBox "Não foi possível criar a cópia temporária:" & vbCrLf & outputPath & vbCrLf & Err.Description, vbCritical, "Erro"
+    MsgBox "N o foi poss vel criar a c pia tempor ria:" & vbCrLf & outputPath & vbCrLf & Err.Description, vbCritical, "Erro"
     Exit Sub
 ErroAbrirExcel:
-    MsgBox "Não foi possível abrir ou preparar a cópia:" & vbCrLf & outputPath & vbCrLf & Err.Description, vbCritical, "Erro"
+    Dim descricaoErro As String: descricaoErro = Err.Description
+    Set mVistaCache = Nothing
+    On Error Resume Next: CATIA.RefreshDisplay = True: xlApp.ScreenUpdating = True: On Error GoTo 0
+    MsgBox "N o foi poss vel abrir ou preparar a c pia:" & vbCrLf & outputPath & vbCrLf & descricaoErro, vbCritical, "Erro"
 End Sub
 
 Private Sub ProcessarCalloutsDaFolha(ByVal oSheet As drawingSheet, ByRef Zonas() As ZoneData, ByVal maxZonas As Long, _
     ByRef Occurrences() As OccurrenceData, ByRef nOccurrences As Long, ByRef verdes As Collection, _
     ByRef vermelhos As Collection, ByRef qtdVerdes As Long, ByRef qtdGrupo As Long, ByRef qtdConflito As Long, _
-    ByRef qtdReferencias As Long, ByRef qtdMultiline As Long)
-    Dim i As Long, oView As drawingView
+    ByRef qtdReferencias As Long, ByRef qtdMultiline As Long, ByRef qtdChaves As Long)
+    Dim i As Long, oView As drawingView, inicio As Long
+    Dim nT As Long, objs() As Object, textos() As String, temREF() As Boolean, qtdTexto() As Long
     For i = 1 To oSheet.Views.count
         Set oView = oSheet.Views.item(i)
         If Not VistaDeveSerIgnorada(oView) Then
-            ColetarCalloutsDaVista oSheet, oView, Zonas, maxZonas, Occurrences, nOccurrences, verdes, vermelhos, qtdVerdes, qtdGrupo, qtdConflito, qtdMultiline
-            IdentificarReferenciasDaVista oSheet, oView, Occurrences, nOccurrences, qtdReferencias
-            AssociarQuantidadesDaVista oSheet, oView, Occurrences, nOccurrences
+            EsquecerVistaConvertida
+            LerTextosDaVista oView, objs, textos, temREF, qtdTexto, nT
+            ' Os callouts desta vista ficam em sequencia no fim da lista: de inicio ate nOccurrences.
+            inicio = nOccurrences + 1
+            ColetarCalloutsDaVista oSheet, oView, objs, textos, temREF, qtdTexto, nT, Zonas, maxZonas, Occurrences, nOccurrences, _
+                verdes, vermelhos, qtdVerdes, qtdGrupo, qtdConflito, qtdMultiline
+            If nOccurrences >= inicio Then
+                IdentificarReferenciasDaVista oSheet, oView, objs, temREF, nT, Occurrences, inicio, nOccurrences, qtdReferencias
+                AssociarQuantidadesDaVista oSheet, oView, objs, temREF, qtdTexto, nT, Occurrences, inicio, nOccurrences, qtdChaves
+            End If
         End If
     Next i
 End Sub
 
-Private Sub ColetarCalloutsDaVista(ByVal oSheet As drawingSheet, ByVal oView As drawingView, ByRef Zonas() As ZoneData, _
+' Le cada texto da vista uma vez so: objeto, conteudo, se tem REF e a quantidade escrita
+' nele. Captura, REF e quantidade usam esta copia em vez de reler o CATIA tres vezes.
+Private Sub LerTextosDaVista(ByVal oView As drawingView, ByRef objs() As Object, ByRef textos() As String, _
+    ByRef temREF() As Boolean, ByRef qtdTexto() As Long, ByRef nT As Long)
+    Dim j As Long, oTexts As Object
+    nT = 0
+    On Error Resume Next: Set oTexts = oView.Texts: nT = oTexts.count: On Error GoTo 0
+    If nT = 0 Then Exit Sub
+    ReDim objs(1 To nT): ReDim textos(1 To nT): ReDim temREF(1 To nT): ReDim qtdTexto(1 To nT)
+    For j = 1 To nT
+        On Error Resume Next: Set objs(j) = oTexts.item(j): textos(j) = CStr(objs(j).Text): On Error GoTo 0
+        If Not objs(j) Is Nothing Then
+            temREF(j) = TextoTemREF(textos(j))
+            If Not temREF(j) Then qtdTexto(j) = ExtrairQuantidade(textos(j))
+        End If
+    Next j
+End Sub
+
+' Linhas vazias, Enter sobrando, TAB e espaco nao separavel sao ignorados:
+' "12" + Enter continua sendo um callout simples. Um texto que traz o callout
+' e a quantidade juntos ("15" + "4 PL") e capturado com essa quantidade.
+Private Sub ColetarCalloutsDaVista(ByVal oSheet As drawingSheet, ByVal oView As drawingView, ByRef objs() As Object, _
+    ByRef textos() As String, ByRef temREF() As Boolean, ByRef qtdTexto() As Long, ByVal nT As Long, ByRef Zonas() As ZoneData, _
     ByVal maxZonas As Long, ByRef Occurrences() As OccurrenceData, ByRef nOccurrences As Long, ByRef verdes As Collection, _
     ByRef vermelhos As Collection, ByRef qtdVerdes As Long, ByRef qtdGrupo As Long, ByRef qtdConflito As Long, ByRef qtdMultiline As Long)
-    Dim cnt As Long, j As Long, oText As drawingText, raw As String, linhas() As String, qtdLinhas As Long
-    On Error Resume Next: cnt = oView.Texts.count: On Error GoTo 0
-    For j = 1 To cnt
-        Set oText = Nothing
-        On Error Resume Next: Set oText = oView.Texts.item(j): raw = CStr(oText.Text): On Error GoTo 0
-        If Not oText Is Nothing And Len(Trim$(raw)) > 0 Then
-            If Not TextoTemREF(raw) And Not TextoTemQuantidade(raw) Then
-                SepararTextoEmLinhas raw, linhas, qtdLinhas
-                If qtdLinhas > 1 Then
-                    ProcessarTextoMultilinha oSheet, oView, oText, j, linhas, qtdLinhas, Zonas, maxZonas, Occurrences, nOccurrences, verdes, qtdVerdes, qtdMultiline
-                Else
-                    ProcessarTextoSimples oSheet, oView, oText, j, Trim$(raw), Zonas, maxZonas, Occurrences, nOccurrences, verdes, vermelhos, qtdVerdes, qtdGrupo, qtdConflito
+    Dim j As Long, oText As drawingText, raw As String, linhas() As String, qtdLinhas As Long
+    Dim qty As Long, linhaCallout As String, qtdLinhasCallout As Long
+    For j = 1 To nT
+        If Not objs(j) Is Nothing Then
+            Set oText = objs(j): raw = textos(j)
+            ObterLinhasNaoVazias raw, linhas, qtdLinhas
+            If qtdLinhas > 0 And Not temREF(j) Then
+                qty = qtdTexto(j)
+                qtdLinhasCallout = ContarLinhasCallout(linhas, qtdLinhas, linhaCallout)
+                If qtdLinhasCallout = 1 And (qtdLinhas = 1 Or qty > 0) Then
+                    ProcessarTextoSimples oSheet, oView, oText, j, linhaCallout, qty, Zonas, maxZonas, Occurrences, nOccurrences, verdes, vermelhos, qtdVerdes, qtdGrupo, qtdConflito
+                ElseIf qtdLinhasCallout > 0 And qtdLinhas > 1 Then
+                    ProcessarTextoMultilinha oSheet, oView, oText, j, linhas, qtdLinhas, qty, Zonas, maxZonas, Occurrences, nOccurrences, verdes, qtdVerdes, qtdMultiline
                 End If
             End If
         End If
@@ -225,12 +308,12 @@ Private Sub ColetarCalloutsDaVista(ByVal oSheet As drawingSheet, ByVal oView As 
 End Sub
 
 Private Sub ProcessarTextoSimples(ByVal oSheet As drawingSheet, ByVal oView As drawingView, ByVal oText As drawingText, _
-    ByVal textIndex As Long, ByVal value As String, ByRef Zonas() As ZoneData, ByVal maxZonas As Long, _
+    ByVal textIndex As Long, ByVal value As String, ByVal qty As Long, ByRef Zonas() As ZoneData, ByVal maxZonas As Long, _
     ByRef Occurrences() As OccurrenceData, ByRef nOccurrences As Long, ByRef verdes As Collection, ByRef vermelhos As Collection, _
     ByRef qtdVerdes As Long, ByRef qtdGrupo As Long, ByRef qtdConflito As Long)
     If Not ContemSomenteDigitosCor(value) Then Exit Sub
     Dim status As Long, mode As String, reason As String, source As Long
-    status = ClassificarCalloutParaCor(oText, mode, reason)
+    status = ClassificarCalloutParaCor(oText, value, mode, reason)
     If status = CALLOUT_STATUS_PENDING_GROUP Then AdicionarObjetoSemDuplicar vermelhos, oText: qtdGrupo = qtdGrupo + 1: Exit Sub
     If status = CALLOUT_STATUS_PENDING_CONFLICT Then AdicionarObjetoSemDuplicar vermelhos, oText: qtdConflito = qtdConflito + 1: Exit Sub
     If status = CALLOUT_STATUS_ACCEPTED Then
@@ -243,12 +326,16 @@ Private Sub ProcessarTextoSimples(ByVal oSheet As drawingSheet, ByVal oView As d
     Dim x As Double, y As Double, zone As String
     ObterCoordenadaNaFolha oView, oText, x, y
     zone = EncontrarZonaMaisProxima(x, y, Zonas, maxZonas)
-    AdicionarOcorrencia Occurrences, nOccurrences, NormalizarNumeroCallout(value), 1, zone, oSheet.name, oView.name, x, y, source, textIndex, 1
+    AdicionarOcorrencia Occurrences, nOccurrences, NormalizarNumeroCallout(value), qty, zone, oSheet.name, oView.name, x, y, source, textIndex, 1
+    With Occurrences(nOccurrences)
+        ObterCentroTextoNaFolha oView, oText, .cx, .cy, .fontSize, .halfHeight, .halfWidth
+        If qty > 0 Then .HasExplicitQty = True
+    End With
     AdicionarObjetoSemDuplicar verdes, oText: qtdVerdes = qtdVerdes + 1
 End Sub
 
 Private Sub ProcessarTextoMultilinha(ByVal oSheet As drawingSheet, ByVal oView As drawingView, ByVal oText As drawingText, _
-    ByVal textIndex As Long, ByRef linhas() As String, ByVal qtdLinhas As Long, ByRef Zonas() As ZoneData, ByVal maxZonas As Long, _
+    ByVal textIndex As Long, ByRef linhas() As String, ByVal qtdLinhas As Long, ByVal qty As Long, ByRef Zonas() As ZoneData, ByVal maxZonas As Long, _
     ByRef Occurrences() As OccurrenceData, ByRef nOccurrences As Long, ByRef verdes As Collection, ByRef qtdVerdes As Long, ByRef qtdMultiline As Long)
     If Not TextoEstaSublinhado(oText) Then Exit Sub
     Dim x As Double, y As Double, i As Long, numberLine As String, found As Boolean
@@ -256,28 +343,36 @@ Private Sub ProcessarTextoMultilinha(ByVal oSheet As drawingSheet, ByVal oView A
     For i = 1 To qtdLinhas
         numberLine = Trim$(linhas(i))
         If ContemSomenteDigitosCor(numberLine) Then
-            AdicionarOcorrencia Occurrences, nOccurrences, NormalizarNumeroCallout(numberLine), 1, _
+            AdicionarOcorrencia Occurrences, nOccurrences, NormalizarNumeroCallout(numberLine), qty, _
                 EncontrarZonaMaisProxima(x, y, Zonas, maxZonas), oSheet.name, oView.name, x, y, SOURCE_MULTILINE, textIndex, i
+            With Occurrences(nOccurrences)
+                ObterCentroTextoNaFolha oView, oText, .cx, .cy, .fontSize, .halfHeight, .halfWidth
+                ' Cada linha fica na sua altura, para o "2 PL" ao lado ir para a linha certa.
+                If .fontSize > 0 Then
+                    .cy = .cy + .halfHeight - .fontSize / 2 - (i - 1) * .fontSize * TEXT_LINE_SPACING
+                    .halfHeight = .fontSize / 2
+                End If
+                If qty > 0 Then .HasExplicitQty = True
+            End With
             qtdMultiline = qtdMultiline + 1: found = True
         End If
     Next i
     If found Then AdicionarObjetoSemDuplicar verdes, oText: qtdVerdes = qtdVerdes + 1
 End Sub
 
-Private Sub IdentificarReferenciasDaVista(ByVal oSheet As drawingSheet, ByVal oView As drawingView, _
-    ByRef Occurrences() As OccurrenceData, ByVal nOccurrences As Long, ByRef qtdReferencias As Long)
-    If nOccurrences = 0 Then Exit Sub
-    Dim cnt As Long, j As Long, idx As Long, t As drawingText, s As String, x As Double, y As Double, tol As Double
-    On Error Resume Next: cnt = oView.Texts.count: On Error GoTo 0
+Private Sub IdentificarReferenciasDaVista(ByVal oSheet As drawingSheet, ByVal oView As drawingView, ByRef objs() As Object, _
+    ByRef temREF() As Boolean, ByVal nT As Long, ByRef Occurrences() As OccurrenceData, ByVal inicio As Long, _
+    ByVal nOccurrences As Long, ByRef qtdReferencias As Long)
+    If nOccurrences < inicio Then Exit Sub
+    Dim j As Long, idx As Long, x As Double, y As Double, tol As Double, sheetName As String, viewName As String
+    sheetName = oSheet.name: viewName = oView.name
     tol = ObterToleranciaAdaptativa(oView, REF_DISTANCE_MIN, REF_DISTANCE_MAX, REF_DISTANCE_BASE)
-    For j = 1 To cnt
-        Set t = Nothing
-        On Error Resume Next: Set t = oView.Texts.item(j): s = CStr(t.Text): On Error GoTo 0
-        If Not t Is Nothing And TextoTemREF(s) Then
-            ObterCoordenadaNaFolha oView, t, x, y
-            For idx = 1 To nOccurrences
+    For j = 1 To nT
+        If temREF(j) Then
+            ObterCoordenadaNaFolha oView, objs(j), x, y
+            For idx = inicio To nOccurrences
                 With Occurrences(idx)
-                    If .Sheet = oSheet.name And .View = oView.name And Not .IsReference Then
+                    If .Sheet = sheetName And .View = viewName And Not .IsReference Then
                         If .sourceType = SOURCE_UNDERLINED Or .sourceType = SOURCE_MULTILINE Then
                             If DistanciaEntrePontos(x, y, .x, .y) <= tol Then .IsReference = True: qtdReferencias = qtdReferencias + 1
                         End If
@@ -288,40 +383,249 @@ Private Sub IdentificarReferenciasDaVista(ByVal oSheet As drawingSheet, ByVal oV
     Next j
 End Sub
 
-Private Sub AssociarQuantidadesDaVista(ByVal oSheet As drawingSheet, ByVal oView As drawingView, _
-    ByRef Occurrences() As OccurrenceData, ByVal nOccurrences As Long)
-    If nOccurrences = 0 Then Exit Sub
-    Dim cnt As Long, j As Long, t As drawingText, s As String, qty As Long, x As Double, y As Double, best As Long
-    Dim re As Object: Set re = CreateObject("VBScript.RegExp")
-    re.Pattern = "(\d+)": re.Global = False: re.IgnoreCase = True
-    On Error Resume Next: cnt = oView.Texts.count: On Error GoTo 0
+Private Sub AssociarQuantidadesDaVista(ByVal oSheet As drawingSheet, ByVal oView As drawingView, ByRef objs() As Object, _
+    ByRef temREF() As Boolean, ByRef qtdTexto() As Long, ByVal nT As Long, ByRef Occurrences() As OccurrenceData, _
+    ByVal inicio As Long, ByVal nOccurrences As Long, ByRef qtdChaves As Long)
+    If nOccurrences < inicio Then Exit Sub
+    Dim j As Long, i As Long, qty As Long, best As Long, sheetName As String, viewName As String
+    Dim cx As Double, cy As Double, fs As Double, hh As Double, hw As Double, doAglomerado As Boolean
+    Dim tamanhos() As Long, qtdAglomerado() As Long, nGrupos As Long, capturado() As Boolean
+    sheetName = oSheet.name: viewName = oView.name
+    mChavesCarregadas = False: mNumChaves = 0
+    nGrupos = AgruparBaloesDaVista(sheetName, viewName, Occurrences, inicio, nOccurrences, tamanhos)
+    ReDim qtdAglomerado(0 To nGrupos)
+    ' Textos que ja viraram callout desta vista (inclusive "15" + "4 PL", que ja traz a quantidade).
+    ReDim capturado(0 To nT)
+    For i = inicio To nOccurrences
+        If Occurrences(i).sourceTextIndex >= 1 And Occurrences(i).sourceTextIndex <= nT Then capturado(Occurrences(i).sourceTextIndex) = True
+    Next i
     Dim tol As Double: tol = ObterToleranciaAdaptativa(oView, QTY_DISTANCE_MIN, QTY_DISTANCE_MAX, QTY_DISTANCE_BASE)
-    For j = 1 To cnt
-        Set t = Nothing
-        On Error Resume Next: Set t = oView.Texts.item(j): s = UCase$(Trim$(CStr(t.Text))): On Error GoTo 0
-        If Not t Is Nothing And TextoTemQuantidade(s) Then
-            qty = ExtrairQuantidade(s, re)
+    For j = 1 To nT
+        If Not objs(j) Is Nothing Then
+            ' Texto capturado como callout com a propria quantidade ("15" + "4 PL") ja foi tratado.
+            ' Quantidade de referencia ("4 PL REF") nao conta.
+            If capturado(j) Or temREF(j) Then qty = 0 Else qty = qtdTexto(j)
             If qty > 0 Then
-                ObterCoordenadaNaFolha oView, t, x, y
-                best = ProcurarOcorrenciaMaisProxima(oSheet.name, oView.name, x, y, tol, Occurrences, nOccurrences)
-                If best > 0 Then Occurrences(best).qty = qty: Occurrences(best).HasExplicitQty = True
+                ObterCentroTextoNaFolha oView, objs(j), cx, cy, fs, hh, hw
+                best = ProcurarOcorrenciaMaisProxima(sheetName, viewName, cx, cy, tol, Occurrences, inicio, nOccurrences, False)
+                doAglomerado = False
+                If best > 0 Then doAglomerado = EhQuantidadeDoAglomerado(Occurrences(best), cx, cy, tamanhos)
+                If doAglomerado Then
+                    ' Quantidade embaixo do ultimo balao do aglomerado: vale para todos.
+                    qtdAglomerado(Occurrences(best).clusterId) = qty
+                ElseIf AplicarQuantidadeDaChave(oView, sheetName, viewName, cx, cy, hw, fs, qty, Occurrences, inicio, nOccurrences) Then
+                    ' Linha vertical englobando 2 ou mais callouts: a quantidade vale para todos eles.
+                    qtdChaves = qtdChaves + 1
+                Else
+                    ' Quantidade ao lado: vale so para o callout na mesma linha, o mais perto na horizontal.
+                    ' Se esse callout for REF, a quantidade e descartada e nao passa para o vizinho.
+                    best = ProcurarOcorrenciaNaMesmaLinha(sheetName, viewName, cx, cy, hh, fs, tol, Occurrences, inicio, nOccurrences)
+                    If best > 0 Then
+                        If Not Occurrences(best).IsReference Then Occurrences(best).qty = qty: Occurrences(best).HasExplicitQty = True
+                    End If
+                End If
             End If
         End If
     Next j
+    ' Quantidade do aglomerado multiplica a individual: grupo "2 PL" + balao com "2 PL" ao lado = 4.
+    For i = inicio To nOccurrences
+        With Occurrences(i)
+            If EhBalaoDaVista(Occurrences(i), sheetName, viewName) Then
+                If .clusterId > 0 And .clusterId <= nGrupos Then
+                    If qtdAglomerado(.clusterId) > 0 Then
+                        If .HasExplicitQty Then .qty = .qty * qtdAglomerado(.clusterId) Else .qty = qtdAglomerado(.clusterId)
+                        .HasExplicitQty = True
+                    End If
+                End If
+            End If
+        End With
+    Next i
 End Sub
 
+' ===== AGLOMERADO DE BALOES =====
+' Baloes da mesma vista empilhados na vertical (centros a ate CLUSTER_LINK_FACTOR x
+' altura do texto, mais afastados na vertical do que na horizontal) formam um aglomerado.
+' Baloes lado a lado nao agrupam. Grava .clusterId (1..n) nos baloes desta vista
+' e o numero de baloes de cada aglomerado em tamanhos(). Devolve quantos aglomerados ha.
+Private Function AgruparBaloesDaVista(ByVal sheetName As String, ByVal viewName As String, _
+    ByRef Occurrences() As OccurrenceData, ByVal inicio As Long, ByVal nOccurrences As Long, ByRef tamanhos() As Long) As Long
+    Dim i As Long, j As Long, k As Long, a As Long, b As Long, nGrupos As Long
+    Dim grupo() As Long, mapa() As Long
+    ReDim grupo(1 To nOccurrences): ReDim mapa(1 To nOccurrences): ReDim tamanhos(0 To nOccurrences)
+    For i = inicio To nOccurrences
+        If EhBalaoDaVista(Occurrences(i), sheetName, viewName) Then grupo(i) = i
+    Next i
+    For i = inicio To nOccurrences
+        If grupo(i) > 0 Then
+            For j = i + 1 To nOccurrences
+                If grupo(j) > 0 And grupo(j) <> grupo(i) Then
+                    If DistanciaEntrePontos(Occurrences(i).cx, Occurrences(i).cy, Occurrences(j).cx, Occurrences(j).cy) <= _
+                       DistanciaDeAglomerado(Occurrences(i), Occurrences(j)) And _
+                       Abs(Occurrences(i).cy - Occurrences(j).cy) > Abs(Occurrences(i).cx - Occurrences(j).cx) Then
+                        a = grupo(i): b = grupo(j)
+                        For k = inicio To nOccurrences
+                            If grupo(k) = b Then grupo(k) = a
+                        Next k
+                    End If
+                End If
+            Next j
+        End If
+    Next i
+    For i = inicio To nOccurrences
+        If grupo(i) > 0 Then
+            If mapa(grupo(i)) = 0 Then nGrupos = nGrupos + 1: mapa(grupo(i)) = nGrupos
+            Occurrences(i).clusterId = mapa(grupo(i))
+            tamanhos(mapa(grupo(i))) = tamanhos(mapa(grupo(i))) + 1
+        ElseIf Occurrences(i).Sheet = sheetName And Occurrences(i).View = viewName Then
+            Occurrences(i).clusterId = 0
+        End If
+    Next i
+    AgruparBaloesDaVista = nGrupos
+End Function
+
+Private Function EhBalaoDaVista(ByRef occ As OccurrenceData, ByVal sheetName As String, ByVal viewName As String) As Boolean
+    EhBalaoDaVista = (occ.sourceType = SOURCE_BALLOON And Not occ.IsReference And occ.Sheet = sheetName And occ.View = viewName)
+End Function
+
+Private Function DistanciaDeAglomerado(ByRef a As OccurrenceData, ByRef b As OccurrenceData) As Double
+    Dim fs As Double: fs = a.fontSize
+    If b.fontSize > fs Then fs = b.fontSize
+    If fs > 0 Then DistanciaDeAglomerado = fs * CLUSTER_LINK_FACTOR Else DistanciaDeAglomerado = CLUSTER_LINK_DEFAULT
+End Function
+
+' A quantidade e do aglomerado quando o balao mais proximo faz parte de um aglomerado
+' (2 ou mais baloes) e o texto esta mais abaixo dele do que ao lado.
+Private Function EhQuantidadeDoAglomerado(ByRef occ As OccurrenceData, ByVal cx As Double, ByVal cy As Double, ByRef tamanhos() As Long) As Boolean
+    If occ.sourceType <> SOURCE_BALLOON Or occ.clusterId <= 0 Then Exit Function
+    If occ.clusterId > UBound(tamanhos) Then Exit Function
+    If tamanhos(occ.clusterId) < 2 Then Exit Function
+    EhQuantidadeDoAglomerado = ((occ.cy - cy) > Abs(cx - occ.cx))
+End Function
+
+' Compara pelo centro dos textos. somenteSemQtd = True ignora callouts que ja receberam quantidade.
 Private Function ProcurarOcorrenciaMaisProxima(ByVal sheetName As String, ByVal viewName As String, ByVal x As Double, ByVal y As Double, _
-    ByVal maxDistance As Double, ByRef Occurrences() As OccurrenceData, ByVal nOccurrences As Long) As Long
+    ByVal maxDistance As Double, ByRef Occurrences() As OccurrenceData, ByVal inicio As Long, ByVal nOccurrences As Long, ByVal somenteSemQtd As Boolean) As Long
     Dim i As Long, d As Double, minD As Double: minD = 1E+99
-    For i = 1 To nOccurrences
+    For i = inicio To nOccurrences
         With Occurrences(i)
-            If .Sheet = sheetName And .View = viewName And Not .IsReference And Not .HasExplicitQty Then
-                d = DistanciaEntrePontos(x, y, .x, .y)
+            If .Sheet = sheetName And .View = viewName And Not .IsReference And Not (somenteSemQtd And .HasExplicitQty) Then
+                d = DistanciaEntrePontos(x, y, .cx, .cy)
                 If d <= maxDistance And d < minD Then minD = d: ProcurarOcorrenciaMaisProxima = i
             End If
         End With
     Next i
 End Function
+
+' Callout na mesma linha do texto de quantidade: as alturas dos dois blocos se sobrepoem
+' e a distancia horizontal entre os centros fica dentro de maxDx; vence o mais perto na
+' horizontal e, no empate (linhas do mesmo texto multilinha), o mais perto na vertical.
+' Ignora callouts que ja receberam quantidade. Os REF entram na busca para a quantidade
+' ao lado deles nao ir parar no vizinho.
+Private Function ProcurarOcorrenciaNaMesmaLinha(ByVal sheetName As String, ByVal viewName As String, ByVal x As Double, ByVal y As Double, _
+    ByVal halfHeight As Double, ByVal fontSize As Double, ByVal maxDx As Double, ByRef Occurrences() As OccurrenceData, ByVal inicio As Long, ByVal nOccurrences As Long) As Long
+    Dim i As Long, dx As Double, dy As Double, minDx As Double, minDy As Double: minDx = 1E+99: minDy = 1E+99
+    For i = inicio To nOccurrences
+        With Occurrences(i)
+            If .Sheet = sheetName And .View = viewName And Not .HasExplicitQty Then
+                dx = Abs(x - .cx): dy = Abs(y - .cy)
+                If dx <= maxDx And dy <= ToleranciaDeLinha(halfHeight, fontSize, Occurrences(i)) Then
+                    If dx < minDx - 0.001 Or (Abs(dx - minDx) <= 0.001 And dy < minDy) Then
+                        minDx = dx: minDy = dy: ProcurarOcorrenciaNaMesmaLinha = i
+                    End If
+                End If
+            End If
+        End With
+    Next i
+End Function
+
+Private Function ToleranciaDeLinha(ByVal halfHeight As Double, ByVal fontSize As Double, ByRef occ As OccurrenceData) As Double
+    Dim fs As Double: fs = fontSize
+    If occ.fontSize > fs Then fs = occ.fontSize
+    If fs <= 0 Then ToleranciaDeLinha = QTY_LINE_DEFAULT: Exit Function
+    ToleranciaDeLinha = halfHeight + occ.halfHeight + fs * QTY_LINE_SLACK_RATIO
+End Function
+
+' ===== CHAVE DE QUANTIDADE =====
+' "2 REQD" | 38      38 | "2 REQD"
+'          | 50  ou  50 |
+' A linha vertical ao lado do texto de quantidade engloba os callouts do outro lado:
+' todos os que tem o centro dentro da altura dela recebem a quantidade. Precisa de 2 ou
+' mais callouts; com 1 so, vale a regra da mesma linha. Vence a linha mais perto do texto.
+Private Function AplicarQuantidadeDaChave(ByVal oView As drawingView, ByVal sheetName As String, ByVal viewName As String, _
+    ByVal x As Double, ByVal y As Double, ByVal halfWidth As Double, ByVal fontSize As Double, ByVal qty As Long, _
+    ByRef Occurrences() As OccurrenceData, ByVal inicio As Long, ByVal nOccurrences As Long) As Boolean
+    If fontSize <= 0 Then Exit Function
+    If Not mChavesCarregadas Then CarregarChavesDaVista oView
+    If mNumChaves = 0 Then Exit Function
+    Dim k As Long, gap As Double, folga As Double, melhor As Long, melhorGap As Double
+    folga = fontSize * BRACKET_END_SLACK_RATIO: melhorGap = 1E+99
+    For k = 1 To mNumChaves
+        If y >= mChaveYMin(k) - folga And y <= mChaveYMax(k) + folga Then
+            gap = Abs(x - mChaveX(k)) - halfWidth
+            If gap >= -folga And gap <= fontSize * BRACKET_GAP_RATIO And gap < melhorGap Then
+                If CalloutsDaChave(k, sheetName, viewName, x, fontSize, 0, Occurrences, inicio, nOccurrences) >= 2 Then melhor = k: melhorGap = gap
+            End If
+        End If
+    Next k
+    If melhor = 0 Then Exit Function
+    CalloutsDaChave melhor, sheetName, viewName, x, fontSize, qty, Occurrences, inicio, nOccurrences
+    AplicarQuantidadeDaChave = True
+End Function
+
+' Callouts da vista do outro lado da chave k em relacao ao texto (xQty), encostados nela
+' e com o centro dentro da altura dela. REF nao entra. qty = 0 so conta; qty > 0 tambem
+' aplica (multiplica uma quantidade que o callout ja tenha, como no aglomerado).
+Private Function CalloutsDaChave(ByVal k As Long, ByVal sheetName As String, ByVal viewName As String, ByVal xQty As Double, _
+    ByVal fontSize As Double, ByVal qty As Long, ByRef Occurrences() As OccurrenceData, ByVal inicio As Long, ByVal nOccurrences As Long) As Long
+    Dim i As Long, fs As Double, lado As Double
+    lado = Sgn(xQty - mChaveX(k))
+    For i = inicio To nOccurrences
+        With Occurrences(i)
+            If .Sheet = sheetName And .View = viewName And Not .IsReference Then
+                fs = fontSize: If .fontSize > fs Then fs = .fontSize
+                If Sgn(.cx - mChaveX(k)) = -lado And Abs(.cx - mChaveX(k)) - .halfWidth <= fs * BRACKET_GAP_RATIO And _
+                   .cy >= mChaveYMin(k) - fs * BRACKET_END_SLACK_RATIO And .cy <= mChaveYMax(k) + fs * BRACKET_END_SLACK_RATIO Then
+                    CalloutsDaChave = CalloutsDaChave + 1
+                    If qty > 0 Then
+                        If .HasExplicitQty Then .qty = .qty * qty Else .qty = qty
+                        .HasExplicitQty = True
+                    End If
+                End If
+            End If
+        End With
+    Next i
+End Function
+
+' Le as linhas 2D verticais da vista do texto de quantidade e guarda em mm de papel.
+' A geometria e percorrida com For Each: GeometricElements.Item(j) refaz a busca a cada
+' chamada (16 000 linhas = 8 min, medido no V5R20) e travava o CATIA por horas num
+' desenho migrado; For Each le 50 000 linhas em 6 s.
+Private Sub CarregarChavesDaVista(ByVal v As drawingView)
+    Dim nG As Long, ge As Object, g As Object, pts(3) As Variant
+    Dim x1 As Double, y1 As Double, x2 As Double, y2 As Double, comprimento As Double
+    mNumChaves = 0: mChavesCarregadas = True
+    On Error Resume Next: Set ge = v.GeometricElements: nG = ge.count: On Error GoTo 0
+    If nG <= 0 Or nG > BRACKET_MAX_GEOMETRIA Then Exit Sub
+    ReDim mChaveX(1 To nG): ReDim mChaveYMin(1 To nG): ReDim mChaveYMax(1 To nG)
+    On Error Resume Next
+    For Each g In ge
+        If TypeName(g) = "Line2D" And mNumChaves < nG Then
+            Err.Clear
+            g.GetEndPoints pts
+            If Err.number = 0 Then
+                ConverterPontoParaFolha v, CDbl(pts(0)), CDbl(pts(1)), x1, y1
+                ConverterPontoParaFolha v, CDbl(pts(2)), CDbl(pts(3)), x2, y2
+                comprimento = Abs(y1 - y2)
+                If comprimento > 0.001 And Abs(x1 - x2) <= comprimento * BRACKET_VERTICAL_TOL Then
+                    mNumChaves = mNumChaves + 1
+                    mChaveX(mNumChaves) = (x1 + x2) / 2
+                    If y1 < y2 Then mChaveYMin(mNumChaves) = y1: mChaveYMax(mNumChaves) = y2 Else mChaveYMin(mNumChaves) = y2: mChaveYMax(mNumChaves) = y1
+                End If
+            End If
+        End If
+    Next g
+    Err.Clear: On Error GoTo 0
+End Sub
 
 Private Sub ConsolidarOcorrencias(ByRef Occurrences() As OccurrenceData, ByVal nOccurrences As Long, ByRef Callouts() As CalloutData, ByRef nCallouts As Long)
     Dim i As Long, found As Long, zone As String
@@ -370,23 +674,32 @@ Private Sub AdicionarOcorrencia(ByRef Occurrences() As OccurrenceData, ByRef cou
     ByVal zone As String, ByVal sheetName As String, ByVal viewName As String, ByVal x As Double, ByVal y As Double, _
     ByVal source As Long, ByVal textIndex As Long, ByVal lineIndex As Long)
     If Len(number) = 0 Then Exit Sub
-    count = count + 1: ReDim Preserve Occurrences(1 To count)
+    ' A lista cresce em blocos (dobra de tamanho) em vez de ser copiada a cada callout.
+    ' Quem le a lista usa sempre count, nunca o tamanho alocado.
+    count = count + 1
+    If count = 1 Then
+        ReDim Occurrences(1 To 256)
+    ElseIf count > UBound(Occurrences) Then
+        ReDim Preserve Occurrences(1 To UBound(Occurrences) * 2)
+    End If
     With Occurrences(count)
         .number = number: If qty > 0 Then .qty = qty Else .qty = 1
         .zone = zone: .Sheet = sheetName: .View = viewName: .x = x: .y = y
         .sourceType = source: .sourceTextIndex = textIndex: .sourceLineIndex = lineIndex
         .IsReference = False: .HasExplicitQty = False
+        .cx = x: .cy = y: .fontSize = 0: .halfHeight = 0: .halfWidth = 0: .clusterId = 0
     End With
 End Sub
 
 ' ===== ZONE ENGINE: BORDER FIRST, AUXILIARY VIEW FALLBACK =====
-Private Sub MapearZonasDaFolha(ByVal oSheet As drawingSheet, ByRef Zonas() As ZoneData, ByRef maxZonas As Long)
+Private Sub MapearZonasDaFolha(ByVal oSheet As drawingSheet, ByVal numeroFolha As Long, ByRef Zonas() As ZoneData, ByRef maxZonas As Long)
     maxZonas = 0: Erase Zonas
-    If MapearZonasPelaMargem(oSheet, Zonas, maxZonas) Then Exit Sub
+    EsquecerVistaConvertida
+    If MapearZonasPelaMargem(oSheet, numeroFolha, Zonas, maxZonas) Then Exit Sub
     MapearZonasPelaVistaAuxiliar oSheet, Zonas, maxZonas
 End Sub
 
-Private Function MapearZonasPelaMargem(ByVal oSheet As drawingSheet, ByRef Zonas() As ZoneData, ByRef maxZonas As Long) As Boolean
+Private Function MapearZonasPelaMargem(ByVal oSheet As drawingSheet, ByVal numeroFolha As Long, ByRef Zonas() As ZoneData, ByRef maxZonas As Long) As Boolean
     Dim width As Double, height As Double: ObterDimensoesFolha oSheet, width, height
     If width <= 0 Or height <= 0 Then Exit Function
     Dim bg As drawingView: Set bg = ObterBackground(oSheet)
@@ -457,6 +770,7 @@ Private Function MapearZonasPelaMargem(ByVal oSheet As drawingSheet, ByRef Zonas
         rowMarkerCount, _
         cols, _
         columnMarkerCount, _
+        numeroFolha, _
         Zonas, _
         maxZonas
     MapearZonasPelaMargem = (maxZonas > 0)
@@ -483,9 +797,12 @@ Private Sub ColetarMarcadores( _
     Dim textValue As String
     Dim posX As Double
     Dim posY As Double
+    Dim bgTexts As Object
 
+    EsquecerVistaConvertida
     On Error Resume Next
-    textCount = bg.Texts.count
+    Set bgTexts = bg.Texts
+    textCount = bgTexts.count
     On Error GoTo 0
 
     For textIndex = 1 To textCount
@@ -494,7 +811,7 @@ Private Sub ColetarMarcadores( _
         textValue = ""
 
         On Error Resume Next
-        Set borderText = bg.Texts.item(textIndex)
+        Set borderText = bgTexts.item(textIndex)
 
         If Not borderText Is Nothing Then
             textValue = UCase$(Trim$(CStr(borderText.Text)))
@@ -503,7 +820,8 @@ Private Sub ColetarMarcadores( _
         Err.Clear
         On Error GoTo 0
 
-        If Not borderText Is Nothing Then
+        ' So letra ou numero de zona precisa de posicao; o resto do carimbo e pulado.
+        If Not borderText Is Nothing And (EhLetraZona(textValue) Or EhNumeroZona(textValue)) Then
 
             ObterCoordenadaNaFolha _
                 bg, _
@@ -628,13 +946,19 @@ Private Function EscolherEixo(ByRef a() As ZoneMarker, ByVal na As Long, ByRef r
     EscolherEixo = True
 End Function
 
+' O carimbo e o mesmo em todas as folhas (colunas 1, 2, 3...). Na zona, a folha entra
+' na dezena: coluna 9 = A009 na folha 1, A029 na folha 2, A039 na folha 3.
+Private Function NumeroZonaDaFolha(ByVal coluna As Long, ByVal numeroFolha As Long) As Long
+    If numeroFolha <= 1 Then NumeroZonaDaFolha = coluna Else NumeroZonaDaFolha = numeroFolha * 10 + coluna
+End Function
+
 Private Sub ConstruirZonas(ByRef rows() As ZoneMarker, ByVal nr As Long, ByRef cols() As ZoneMarker, ByVal nc As Long, _
-    ByRef zones() As ZoneData, ByRef nz As Long)
+    ByVal numeroFolha As Long, ByRef zones() As ZoneData, ByRef nz As Long)
     Dim r As Long, c As Long
     For r = 1 To nr
         For c = 1 To nc
             nz = nz + 1: ReDim Preserve zones(1 To nz)
-            zones(nz).name = UCase$(rows(r).label) & Format$(cols(c).value, "000")
+            zones(nz).name = UCase$(rows(r).label) & Format$(NumeroZonaDaFolha(cols(c).value, numeroFolha), "000")
             zones(nz).x = cols(c).Position: zones(nz).y = rows(r).Position
         Next c
     Next r
@@ -646,6 +970,7 @@ Private Sub MapearZonasPelaVistaAuxiliar(ByVal oSheet As drawingSheet, ByRef zon
     For i = 1 To oSheet.Views.count
         Set v = oSheet.Views.item(i)
         If EhVistaAuxiliar(v) Then
+            EsquecerVistaConvertida
             For j = 1 To v.Texts.count
                 Set t = v.Texts.item(j): s = CStr(t.Text)
                 If NormalizarZonaAuxiliar(s, normalized) Then
@@ -725,20 +1050,22 @@ Private Function EhVistaAuxiliar(ByVal v As drawingView) As Boolean
 End Function
 
 ' ===== ORIGINAL CALLOUT CLASSIFICATION =====
-Private Function ClassificarCalloutParaCor(ByVal oText As Object, ByRef detectionMode As String, ByRef reason As String) As Long
-    Dim s As String, gf As Long, inf As Long, gr As Boolean, ir As Boolean
+' value = numero do callout ja limpo (sem Enter, TAB ou linha de quantidade).
+Private Function ClassificarCalloutParaCor(ByVal oText As Object, ByVal value As String, ByRef detectionMode As String, ByRef reason As String) As Long
+    Dim s As String, raw As String, firstChar As Long, gf As Long, inf As Long, gr As Boolean, ir As Boolean
     detectionMode = "": reason = "": If oText Is Nothing Then Exit Function
-    On Error Resume Next: s = Trim$(CStr(oText.Text)): If Err.number <> 0 Then Err.Clear: On Error GoTo 0: Exit Function
-    On Error GoTo 0: If Not ContemSomenteDigitosCor(s) Then Exit Function
-    gf = LerFrameGlobalCor(oText, gr): inf = LerFrameInternoCor(oText, Len(s), ir)
+    s = Trim$(value): If Not ContemSomenteDigitosCor(s) Then Exit Function
+    On Error Resume Next: raw = CStr(oText.Text): Err.Clear: On Error GoTo 0
+    firstChar = InStr(1, raw, s, vbBinaryCompare) - 1: If firstChar < 0 Then firstChar = 0
+    gf = LerFrameGlobalCor(oText, gr): inf = LerFrameInternoCor(oText, firstChar, Len(s), ir)
     If gr And (gf = CALLOUT_FRAME_CIRCLE Or gf = CALLOUT_FRAME_LEGACY_53) And Len(s) <= 4 Then detectionMode = "GLOBAL_CIRCLE": ClassificarCalloutParaCor = CALLOUT_STATUS_ACCEPTED: Exit Function
     If gr And ir Then
         If gf = CALLOUT_FRAME_NONE And (inf = CALLOUT_FRAME_CIRCLE Or inf = CALLOUT_FRAME_LEGACY_53) Then
-            If Len(s) <= 3 Then detectionMode = "INTERNAL_CIRCLE": ClassificarCalloutParaCor = CALLOUT_STATUS_ACCEPTED Else reason = "Grupo ou callout ambíguo não contabilizado.": ClassificarCalloutParaCor = CALLOUT_STATUS_PENDING_GROUP
+            If Len(s) <= 3 Then detectionMode = "INTERNAL_CIRCLE": ClassificarCalloutParaCor = CALLOUT_STATUS_ACCEPTED Else reason = "Grupo ou callout amb guo n o contabilizado.": ClassificarCalloutParaCor = CALLOUT_STATUS_PENDING_GROUP
             Exit Function
         End If
         If gf <> CALLOUT_FRAME_NONE And gf <> CALLOUT_FRAME_CIRCLE And gf <> CALLOUT_FRAME_LEGACY_53 And _
-           (inf = CALLOUT_FRAME_CIRCLE Or inf = CALLOUT_FRAME_LEGACY_53) Then reason = "Inconsistência de frame não contabilizada.": ClassificarCalloutParaCor = CALLOUT_STATUS_PENDING_CONFLICT
+           (inf = CALLOUT_FRAME_CIRCLE Or inf = CALLOUT_FRAME_LEGACY_53) Then reason = "Inconsist ncia de frame n o contabilizada.": ClassificarCalloutParaCor = CALLOUT_STATUS_PENDING_CONFLICT
     End If
 End Function
 
@@ -748,9 +1075,9 @@ Private Function LerFrameGlobalCor(ByVal t As Object, ByRef success As Boolean) 
     Err.Clear: On Error GoTo 0
 End Function
 
-Private Function LerFrameInternoCor(ByVal t As Object, ByVal n As Long, ByRef success As Boolean) As Long
+Private Function LerFrameInternoCor(ByVal t As Object, ByVal firstChar As Long, ByVal n As Long, ByRef success As Boolean) As Long
     If n <= 0 Then Exit Function
-    Dim v As Variant: On Error Resume Next: v = t.GetParameterOnSubString(CALLOUT_TEXT_PROPERTY_BORDER, 0, n)
+    Dim v As Variant: On Error Resume Next: v = t.GetParameterOnSubString(CALLOUT_TEXT_PROPERTY_BORDER, firstChar, n)
     If Err.number = 0 And IsNumeric(v) Then LerFrameInternoCor = CLng(v): success = True
     Err.Clear: On Error GoTo 0
 End Function
@@ -762,13 +1089,64 @@ Private Function TextoEstaSublinhado(ByVal t As Object) As Boolean
 End Function
 
 Private Sub ObterCoordenadaNaFolha(ByVal v As drawingView, ByVal t As drawingText, ByRef x As Double, ByRef y As Double)
-    Dim a As Double, sc As Double: On Error Resume Next: a = CDbl(v.angle): On Error GoTo 0: sc = ObterEscalaSegura(v)
-    If Abs(a) > 0.001 Then
-        x = v.x + t.x * sc * Cos(a) - t.y * sc * Sin(a)
-        y = v.y + t.x * sc * Sin(a) + t.y * sc * Cos(a)
-    Else
-        x = v.x + t.x * sc: y = v.y + t.y * sc
+    ConverterPontoParaFolha v, t.x, t.y, x, y
+End Sub
+
+' Descarta a posicao/escala guardada: a proxima conversao rele a vista no CATIA.
+Private Sub EsquecerVistaConvertida()
+    Set mVistaCache = Nothing
+End Sub
+
+' Ponto em coordenadas da vista (px, py) para mm de papel na folha. Posicao, escala e
+' angulo da vista sao lidos uma vez e reaproveitados enquanto a vista for a mesma.
+Private Sub ConverterPontoParaFolha(ByVal v As drawingView, ByVal px As Double, ByVal py As Double, ByRef x As Double, ByRef y As Double)
+    If Not v Is mVistaCache Then
+        mVistaA = 0: On Error Resume Next: mVistaA = CDbl(v.angle): On Error GoTo 0
+        mVistaSc = ObterEscalaSegura(v): mVistaX = v.x: mVistaY = v.y
+        Set mVistaCache = v
     End If
+    If Abs(mVistaA) > 0.001 Then
+        x = mVistaX + px * mVistaSc * Cos(mVistaA) - py * mVistaSc * Sin(mVistaA)
+        y = mVistaY + px * mVistaSc * Sin(mVistaA) + py * mVistaSc * Cos(mVistaA)
+    Else
+        x = mVistaX + px * mVistaSc: y = mVistaY + py * mVistaSc
+    End If
+End Sub
+
+' Centro aproximado do bloco de texto na folha (mm de papel). Parte do ponto de
+' ancoragem e desloca meia largura/altura conforme a ancoragem, estimando o bloco
+' pela altura da fonte e pelo numero de caracteres. Assim o balao e o texto de
+' quantidade sao comparados pelo centro, nao importa onde cada um foi ancorado.
+' halfHeight e halfWidth devolvem meia altura e meia largura estimadas do bloco (0 sem
+' tamanho de fonte).
+Private Sub ObterCentroTextoNaFolha(ByVal v As drawingView, ByVal t As drawingText, ByRef cx As Double, ByRef cy As Double, ByRef fontSize As Double, _
+    Optional ByRef halfHeight As Double, Optional ByRef halfWidth As Double)
+    Dim ax As Double, ay As Double, anchor As Long, raw As String
+    Dim linhas() As String, n As Long, i As Long, maxLen As Long, w As Double, h As Double
+    ObterCoordenadaNaFolha v, t, ax, ay
+    cx = ax: cy = ay: fontSize = 0: halfHeight = 0: halfWidth = 0
+    On Error Resume Next
+    fontSize = CDbl(t.GetFontSize(0, 0)): anchor = CLng(t.AnchorPosition): raw = CStr(t.Text)
+    Err.Clear: On Error GoTo 0
+    If fontSize <= 0 Then fontSize = 0: Exit Sub
+    ObterLinhasNaoVazias raw, linhas, n
+    If n = 0 Then Exit Sub
+    For i = 1 To n
+        If Len(linhas(i)) > maxLen Then maxLen = Len(linhas(i))
+    Next i
+    w = maxLen * fontSize * TEXT_WIDTH_RATIO
+    h = fontSize + (n - 1) * fontSize * TEXT_LINE_SPACING
+    halfHeight = h / 2: halfWidth = w / 2
+    ' CatTextAnchorPosition: 1-3 / 11-13 esquerda, 4-6 / 14-16 centro, 7-9 / 17-19 direita.
+    Select Case anchor
+        Case 1, 2, 3, 11, 12, 13: cx = ax + w / 2
+        Case 7, 8, 9, 17, 18, 19: cx = ax - w / 2
+    End Select
+    ' Topo (Top/Cap) desce meia altura; base (Bottom/Base) sobe meia altura.
+    Select Case anchor
+        Case 1, 4, 7, 11, 14, 17: cy = ay - h / 2
+        Case 3, 6, 9, 13, 16, 19: cy = ay + h / 2
+    End Select
 End Sub
 
 Private Function ObterEscalaSegura(ByVal v As drawingView) As Double
@@ -778,27 +1156,75 @@ Private Function ObterEscalaSegura(ByVal v As drawingView) As Double
     ObterEscalaSegura = sc
 End Function
 
+' As distancias sao medidas na folha (mm de papel), ja convertidas pela escala da
+' vista em ObterCoordenadaNaFolha. O espaco entre um balao e o texto "4 PL" no
+' papel nao depende da escala da vista, entao a tolerancia tambem nao: antes ela
+' encolhia nas vistas reduzidas (1:4 -> 35 mm, 1:10 -> 20 mm) e a quantidade
+' deixava de ser associada.
 Private Function ObterToleranciaAdaptativa(ByVal v As drawingView, ByVal minV As Double, ByVal maxV As Double, ByVal baseV As Double) As Double
-    Dim r As Double: r = baseV * Sqr(ObterEscalaSegura(v)): If r < minV Then r = minV: If r > maxV Then r = maxV
-    ObterToleranciaAdaptativa = r
+    ObterToleranciaAdaptativa = Limitar(baseV, minV, maxV)
 End Function
 
 Private Function DistanciaEntrePontos(ByVal x1 As Double, ByVal y1 As Double, ByVal x2 As Double, ByVal y2 As Double) As Double
     DistanciaEntrePontos = Sqr((x1 - x2) ^ 2 + (y1 - y2) ^ 2)
 End Function
 
-Private Sub SepararTextoEmLinhas(ByVal s As String, ByRef lines() As String, ByRef n As Long)
+' Divide o texto em linhas, troca TAB e espaco nao separavel por espaco e descarta
+' linhas vazias. "12" + Enter vira uma unica linha "12".
+Private Sub ObterLinhasNaoVazias(ByVal s As String, ByRef lines() As String, ByRef n As Long)
     s = Replace(s, vbCrLf, vbLf): s = Replace(s, vbCr, vbLf)
-    Dim p() As String, i As Long: p = Split(s, vbLf): n = UBound(p) - LBound(p) + 1: ReDim lines(1 To n)
-    For i = 1 To n: lines(i) = p(LBound(p) + i - 1): Next i
+    s = Replace(s, vbTab, " "): s = Replace(s, Chr$(160), " ")
+    Dim p() As String, i As Long, linha As String: p = Split(s, vbLf): n = 0
+    If UBound(p) < LBound(p) Then Exit Sub
+    ReDim lines(1 To UBound(p) - LBound(p) + 1)
+    For i = LBound(p) To UBound(p)
+        linha = Trim$(p(i))
+        If Len(linha) > 0 Then n = n + 1: lines(n) = linha
+    Next i
 End Sub
 
-Private Function TextoTemREF(ByVal s As String) As Boolean: TextoTemREF = InStr(1, s, "REF", vbTextCompare) > 0: End Function
-Private Function TextoTemQuantidade(ByVal s As String) As Boolean: s = UCase$(Trim$(s)): TextoTemQuantidade = (InStr(1, s, "REQD", vbTextCompare) > 0 Or InStr(1, s, "PL", vbTextCompare) > 0): End Function
+' Quantas linhas sao so numero (callout); devolve a primeira em primeiraLinha.
+Private Function ContarLinhasCallout(ByRef lines() As String, ByVal n As Long, ByRef primeiraLinha As String) As Long
+    Dim i As Long: primeiraLinha = ""
+    For i = 1 To n
+        If ContemSomenteDigitosCor(lines(i)) Then
+            ContarLinhasCallout = ContarLinhasCallout + 1
+            If Len(primeiraLinha) = 0 Then primeiraLinha = lines(i)
+        End If
+    Next i
+End Function
 
-Private Function ExtrairQuantidade(ByVal s As String, ByVal re As Object) As Long
-    If re Is Nothing Or Not re.Test(s) Then Exit Function
-    On Error Resume Next: ExtrairQuantidade = CLng(re.Execute(s)(0).SubMatches(0)): If Err.number <> 0 Then ExtrairQuantidade = 0
+' ===== PALAVRAS-CHAVE (REF / QUANTIDADE) =====
+' Antes "REF" e "PL" eram procurados em qualquer lugar do texto: REFERENCE, PREFERRED,
+' PLATE, APPLY e SPLICE tambem casavam, e o primeiro numero da nota virava quantidade.
+' Agora REF precisa ser palavra isolada e a quantidade e o numero colado na palavra-chave.
+Private Function CriarRegex(ByVal pattern As String) As Object
+    Dim re As Object: Set re = CreateObject("VBScript.RegExp")
+    re.pattern = pattern: re.Global = False: re.IgnoreCase = True
+    Set CriarRegex = re
+End Function
+
+Private Function TextoTemREF(ByVal s As String) As Boolean
+    Static re As Object
+    If re Is Nothing Then Set re = CriarRegex("(^|[^A-Z])REF([^A-Z]|$)")
+    TextoTemREF = re.Test(s)
+End Function
+
+' Aceita "4 PL", "4PL", "4 PLCS", "4 PLACES", "(4) PL", "4X PL", "2 REQD", "2 REQ'D",
+' "2 REQUIRED", "REQD 2", "REQ'D: 2" e "REQUIRED 2". Em "ITEM 12, 4 PL" a quantidade e 4, nao 12.
+Private Function ExtrairQuantidade(ByVal s As String) As Long
+    Static reAntes As Object, reDepois As Object
+    If reAntes Is Nothing Then
+        Set reAntes = CriarRegex("\(?(\d+)\)?\s*X?\s*(PLCS|PLACES|PLS|PL|REQUIRED|REQ'D|REQD)([^A-Z]|$)")
+        Set reDepois = CriarRegex("(^|[^A-Z])(REQUIRED|REQ'D|REQD)\s*[:=]?\s*(\d+)")
+    End If
+    On Error Resume Next
+    If reAntes.Test(s) Then
+        ExtrairQuantidade = CLng(reAntes.Execute(s)(0).SubMatches(0))
+    ElseIf reDepois.Test(s) Then
+        ExtrairQuantidade = CLng(reDepois.Execute(s)(0).SubMatches(2))
+    End If
+    If Err.number <> 0 Then ExtrairQuantidade = 0
     Err.Clear: On Error GoTo 0
 End Function
 
@@ -822,22 +1248,15 @@ End Function
 
 Private Sub AdicionarObjetoSemDuplicar(ByRef objects As Collection, ByVal obj As Object)
     If objects Is Nothing Or obj Is Nothing Then Exit Sub
-    Dim i As Long: For i = 1 To objects.count: If objects.item(i) Is obj Then Exit Sub
-    Next i: objects.Add obj
+    ' Chave pelo ponteiro do objeto: o duplicado e recusado sem varrer a colecao inteira.
+    On Error Resume Next: objects.Add obj, "o" & CStr(ObjPtr(obj)): Err.Clear: On Error GoTo 0
 End Sub
-
-Private Function AplicarCorEmLote(ByVal doc As Object, ByVal objects As Collection, ByVal r As Long, ByVal g As Long, ByVal b As Long) As Boolean
-    If doc Is Nothing Or objects Is Nothing Then Exit Function
-    If objects.count = 0 Then Exit Function
-    Dim sel As Object, vis As Object, i As Long: Set sel = doc.Selection: sel.Clear
-    On Error Resume Next: For i = 1 To objects.count: sel.Add objects.item(i): Next i
-    Set vis = sel.VisProperties: vis.SetRealColor r, g, b, 1: AplicarCorEmLote = (Err.number = 0): Err.Clear: sel.Clear: On Error GoTo 0
-End Function
 
 Private Function LimparNomeArquivo(ByVal s As String) As String
     Dim invalid As Variant, x As Variant: invalid = Array("\", "/", ":", "*", "?", Chr$(34), "<", ">", "|")
     s = Trim$(s): For Each x In invalid: s = Replace(s, CStr(x), "_"): Next x
-    If Len(s) = 0 Then s = "Drawing": LimparNomeArquivo = s
+    If Len(s) = 0 Then s = "Drawing"
+    LimparNomeArquivo = s
 End Function
 
 Private Function ObterCaminhoDisponivel(ByVal folder As String, ByVal name As String, ByVal stamp As String) As String
@@ -867,3 +1286,4 @@ Private Sub RestaurarWorkingViewsPrimeiraFolha(ByVal doc As drawingDocument)
     Next i
     On Error Resume Next: CATIA.ActiveWindow.ActiveViewer.Update: On Error GoTo 0
 End Sub
+
