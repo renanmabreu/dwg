@@ -1,3 +1,4 @@
+
 Option Explicit
 
 Private Const PLANILHA_DESTINO As String = "Dados_Callouts"
@@ -14,6 +15,9 @@ Private Const ORIGEM_PN As Long = 2
 Private Const ORIGEM_POSICAO As Long = 13
 Private Const ORIGEM_ZONA As Long = 14
 Private Const ORIGEM_QUANTIDADE As Long = 20
+Private Const ORIGEM_PROGRAMA As Long = 15
+Private Const ORIGEM_SN_INICIAL As Long = 18
+Private Const ORIGEM_SN_FINAL As Long = 19
 
 ' Colunas do template
 Private Const DESTINO_PN As Long = 18
@@ -322,6 +326,9 @@ Private Sub ImportarArquivoSAPParaDicionario( _
 
     Dim dadosRegistro As Variant
 
+    Dim valorEfetividade As String
+    Dim dictEfetividade As Object
+
     On Error GoTo TrataErroArquivo
 
     Set wbSAP = Workbooks.Open( _
@@ -410,23 +417,68 @@ Private Sub ImportarArquivoSAPParaDicionario( _
                     posicaoNormalizada & "|" & _
                     zonaNormalizada
 
+                ' Efetividade = programa + faixa de SN.
+                ' A mesma posicao em efetividades diferentes
+                ' (ex.: programa 0170 e 0190) nao e somada:
+                ' vale a maior quantidade entre elas.
+                ' Linhas da mesma efetividade continuam somando.
+                valorEfetividade = _
+                    ObterTextoExibido( _
+                        wsSAP.Cells( _
+                            linhaSAP, _
+                            ORIGEM_PROGRAMA)) & "|" & _
+                    ObterTextoExibido( _
+                        wsSAP.Cells( _
+                            linhaSAP, _
+                            ORIGEM_SN_INICIAL)) & "|" & _
+                    ObterTextoExibido( _
+                        wsSAP.Cells( _
+                            linhaSAP, _
+                            ORIGEM_SN_FINAL))
+
                 If dictSAP.Exists(chaveComposta) Then
 
                     dadosRegistro = dictSAP(chaveComposta)
 
+                    Set dictEfetividade = dadosRegistro(4)
+
+                    If dictEfetividade.Exists(valorEfetividade) Then
+
+                        dictEfetividade(valorEfetividade) = _
+                            CDbl(dictEfetividade(valorEfetividade)) + _
+                            quantidadeNumerica
+
+                    Else
+
+                        dictEfetividade.Add _
+                            valorEfetividade, _
+                            quantidadeNumerica
+
+                    End If
+
                     dadosRegistro(3) = _
-                        CDbl(dadosRegistro(3)) + _
-                        quantidadeNumerica
+                        MaiorQuantidadeEntreEfetividades( _
+                            dictEfetividade)
 
                     dictSAP(chaveComposta) = dadosRegistro
 
                 Else
 
+                    Set dictEfetividade = _
+                        CreateObject("Scripting.Dictionary")
+
+                    dictEfetividade.CompareMode = vbTextCompare
+
+                    dictEfetividade.Add _
+                        valorEfetividade, _
+                        quantidadeNumerica
+
                     dadosRegistro = Array( _
                         valorPN, _
                         valorPosicao, _
                         valorZona, _
-                        quantidadeNumerica)
+                        quantidadeNumerica, _
+                        dictEfetividade)
 
                     dictSAP.Add _
                         chaveComposta, _
@@ -474,6 +526,33 @@ TrataErroArquivo:
         descricaoErro
 
 End Sub
+
+' ========================================================================
+' MAIOR QUANTIDADE ENTRE AS EFETIVIDADES DE UMA POSICAO
+' ========================================================================
+
+Private Function MaiorQuantidadeEntreEfetividades( _
+    ByVal dictEfetividade As Object) As Double
+
+    Dim chave As Variant
+
+    MaiorQuantidadeEntreEfetividades = 0#
+
+    If dictEfetividade Is Nothing Then Exit Function
+
+    For Each chave In dictEfetividade.Keys
+
+        If CDbl(dictEfetividade(chave)) > _
+           MaiorQuantidadeEntreEfetividades Then
+
+            MaiorQuantidadeEntreEfetividades = _
+                CDbl(dictEfetividade(chave))
+
+        End If
+
+    Next chave
+
+End Function
 
 ' ========================================================================
 ' CONVERSÃO DE QUANTIDADE IMPORTADA
@@ -565,7 +644,7 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
     Dim dictZonaDrawingPorPosicao As Object
     Dim dictZonaSAPPorPosicao As Object
 
-    Dim dictQtdDrawingPorZona As Object
+    Dim dictQtdDrawingPorPosicao As Object
     Dim dictQtdSAPPorPosicao As Object
 
     Dim dictQtdInvalidaDrawing As Object
@@ -600,7 +679,7 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
     Set dictZonaSAPPorPosicao = _
         CreateObject("Scripting.Dictionary")
 
-    Set dictQtdDrawingPorZona = _
+    Set dictQtdDrawingPorPosicao = _
         CreateObject("Scripting.Dictionary")
 
     Set dictQtdSAPPorPosicao = _
@@ -618,7 +697,7 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
     dictZonaDrawingPorPosicao.CompareMode = vbTextCompare
     dictZonaSAPPorPosicao.CompareMode = vbTextCompare
 
-    dictQtdDrawingPorZona.CompareMode = vbTextCompare
+    dictQtdDrawingPorPosicao.CompareMode = vbTextCompare
     dictQtdSAPPorPosicao.CompareMode = vbTextCompare
 
     dictQtdInvalidaDrawing.CompareMode = vbTextCompare
@@ -696,7 +775,7 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
     '
     ' 1. Registra cada posição existente.
     ' 2. Registra a zona correspondente a cada posição.
-    ' 3. Soma a quantidade total de cada zona.
+    ' 3. Soma a quantidade total de cada posição.
     ' ====================================================================
 
     For linha = PRIMEIRA_LINHA_DESTINO _
@@ -734,7 +813,7 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
 
         End If
 
-        If Len(zonaNormalizada) > 0 Then
+        If Len(posicaoNormalizada) > 0 Then
 
             quantidadeValida = _
                 TentarObterQuantidadeComparacao( _
@@ -745,39 +824,39 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
 
             If quantidadeValida Then
 
-                If dictQtdDrawingPorZona.Exists( _
-                        zonaNormalizada) Then
+                If dictQtdDrawingPorPosicao.Exists( _
+                        posicaoNormalizada) Then
 
-                    dictQtdDrawingPorZona(zonaNormalizada) = _
+                    dictQtdDrawingPorPosicao(posicaoNormalizada) = _
                         CDbl( _
-                            dictQtdDrawingPorZona( _
-                                zonaNormalizada)) + _
+                            dictQtdDrawingPorPosicao( _
+                                posicaoNormalizada)) + _
                         quantidade
 
                 Else
 
-                    dictQtdDrawingPorZona.Add _
-                        zonaNormalizada, _
+                    dictQtdDrawingPorPosicao.Add _
+                        posicaoNormalizada, _
                         quantidade
 
                 End If
 
             Else
 
-                If Not dictQtdDrawingPorZona.Exists( _
-                        zonaNormalizada) Then
+                If Not dictQtdDrawingPorPosicao.Exists( _
+                        posicaoNormalizada) Then
 
-                    dictQtdDrawingPorZona.Add _
-                        zonaNormalizada, _
+                    dictQtdDrawingPorPosicao.Add _
+                        posicaoNormalizada, _
                         0#
 
                 End If
 
                 If Not dictQtdInvalidaDrawing.Exists( _
-                        zonaNormalizada) Then
+                        posicaoNormalizada) Then
 
                     dictQtdInvalidaDrawing.Add _
-                        zonaNormalizada, _
+                        posicaoNormalizada, _
                         True
 
                 End If
@@ -946,27 +1025,27 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
         ' --------------------------------------------------------------
         ' QUANTIDADE
         '
-        ' Compara o total da zona no Drawing com a quantidade SAP
+        ' Compara o total da posição no Drawing com a quantidade SAP
         ' da posição correspondente.
         ' --------------------------------------------------------------
 
         If posicaoCorreta And zonaCorreta Then
 
-            If dictQtdDrawingPorZona.Exists( _
-                    zonaNormalizada) And _
+            If dictQtdDrawingPorPosicao.Exists( _
+                    posicaoNormalizada) And _
                dictQtdSAPPorPosicao.Exists( _
                     posicaoNormalizada) Then
 
                 If Not dictQtdInvalidaDrawing.Exists( _
-                            zonaNormalizada) And _
+                            posicaoNormalizada) And _
                    Not dictQtdInvalidaSAP.Exists( _
                             posicaoNormalizada) Then
 
                     quantidadeCorreta = _
                         QuantidadesSaoIguais( _
                             CDbl( _
-                                dictQtdDrawingPorZona( _
-                                    zonaNormalizada)), _
+                                dictQtdDrawingPorPosicao( _
+                                    posicaoNormalizada)), _
                             CDbl( _
                                 dictQtdSAPPorPosicao( _
                                     posicaoNormalizada)))
@@ -1092,21 +1171,21 @@ Private Sub CompararPosicaoZona(ByVal ws As Worksheet)
 
         If posicaoCorreta And zonaCorreta Then
 
-            If dictQtdDrawingPorZona.Exists( _
-                    zonaNormalizada) And _
+            If dictQtdDrawingPorPosicao.Exists( _
+                    posicaoNormalizada) And _
                dictQtdSAPPorPosicao.Exists( _
                     posicaoNormalizada) Then
 
                 If Not dictQtdInvalidaDrawing.Exists( _
-                            zonaNormalizada) And _
+                            posicaoNormalizada) And _
                    Not dictQtdInvalidaSAP.Exists( _
                             posicaoNormalizada) Then
 
                     quantidadeCorreta = _
                         QuantidadesSaoIguais( _
                             CDbl( _
-                                dictQtdDrawingPorZona( _
-                                    zonaNormalizada)), _
+                                dictQtdDrawingPorPosicao( _
+                                    posicaoNormalizada)), _
                             CDbl( _
                                 dictQtdSAPPorPosicao( _
                                     posicaoNormalizada)))
@@ -1738,6 +1817,4 @@ Private Sub RestaurarEstadoExcel()
     On Error GoTo 0
 
 End Sub
-
-
 
