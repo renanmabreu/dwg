@@ -34,8 +34,8 @@ Option Explicit
         ByVal hWndInsertAfter As LongPtr, _
         ByVal x As Long, _
         ByVal y As Long, _
-        ByVal cX As Long, _
-        ByVal cY As Long, _
+        ByVal cx As Long, _
+        ByVal cy As Long, _
         ByVal uFlags As Long) As Long
 
     Private Declare PtrSafe Function DrawMenuBar _
@@ -204,7 +204,7 @@ End Sub
 
 Private Sub Label7_Click()
 
-    ExecutarConversaoTemplate
+    ConvertTemplate
 
 End Sub
 ' ============================================================
@@ -346,6 +346,47 @@ Private Sub FecharDrawingTools()
     On Error GoTo 0
 
 End Sub
+
+Private Sub lblFechar_Click()
+
+    Unload Me
+
+End Sub
+
+Private Sub lblSplit2D_Click()
+
+    On Error GoTo TrataErro
+
+    Me.Hide
+    ExecutarSplit2D
+    Me.Show
+
+    Exit Sub
+
+TrataErro:
+    Me.Show
+    MsgBox "Erro ao executar o SPLIT 2D:" & vbCrLf & _
+           Err.Description, vbCritical, "SPLIT 2D"
+
+End Sub
+
+Private Sub lblSplit3D_Click()
+
+    On Error GoTo TrataErro
+
+    Me.Hide
+    ExecutarSplit3D
+    Me.Show
+
+    Exit Sub
+
+TrataErro:
+    Me.Show
+    MsgBox "Erro ao executar o SPLIT 3D:" & vbCrLf & _
+           Err.Description, vbCritical, "SPLIT 3D"
+
+End Sub
+
 ' ============================================================
 ' PROTECAO DURANTE O ENCERRAMENTO DO USERFORM
 ' ============================================================
@@ -487,7 +528,7 @@ Private Sub Label3_Click()
 
     On Error GoTo ErrorHandler
 
-    MapearCalloutsTodasAsFolhas121
+    MapearCalloutsTodasAsFolhas1214
     Exit Sub
 
 ErrorHandler:
